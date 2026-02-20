@@ -333,14 +333,23 @@ class ServerState:
         # Parse query parameters for voice and text prompts
         requested_voice_prompt_path = None
         voice_prompt_path = None
+        default_voice = "NATF2.pt"
         if self.voice_prompt_dir is not None:
-            voice_prompt_filename = request.query.get("voice_prompt", "NATF2.pt")
+            voice_prompt_filename = request.query.get("voice_prompt", default_voice)
             if voice_prompt_filename:
                 requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+            # Fall back to default voice if requested file doesn't exist
             if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
-                raise FileNotFoundError(
-                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
+                clog.log("warning",
+                    f"Voice prompt '{voice_prompt_filename}' not found, falling back to '{default_voice}'"
                 )
+                fallback_path = os.path.join(self.voice_prompt_dir, default_voice)
+                if os.path.exists(fallback_path):
+                    voice_prompt_path = fallback_path
+                else:
+                    raise FileNotFoundError(
+                        f"Neither '{voice_prompt_filename}' nor default '{default_voice}' found in '{self.voice_prompt_dir}'"
+                    )
             else:
                 voice_prompt_path = requested_voice_prompt_path
 
@@ -669,7 +678,8 @@ def main():
     if setup_tunnel is not None:
         tunnel = setup_tunnel('localhost', args.port, tunnel_token, None)
         logger.info(f"Tunnel started, if executing on a remote GPU, you can use {tunnel}.")
-    web.run_app(app, port=args.port, ssl_context=ssl_context)
+
+    web.run_app(app, host=args.host, port=args.port, ssl_context=ssl_context)
 
 
 with torch.no_grad():
