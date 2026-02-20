@@ -19,7 +19,18 @@ RUN uv sync
 
 RUN mkdir -p /app/ssl
 
+# RunPod exposes services on specific ports; 8998 is the default for PersonaPlex
 EXPOSE 8998
 
+# Health check for RunPod monitoring
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8998/ || exit 1
+
 ENTRYPOINT []
-CMD ["/app/moshi/.venv/bin/python", "-m", "moshi.server", "--ssl", "/app/ssl"]
+
+# Run on 0.0.0.0 to be accessible from RunPod proxy, with SSL and static=none (API only mode)
+CMD ["/app/moshi/.venv/bin/python", "-m", "moshi.server", \
+     "--host", "0.0.0.0", \
+     "--port", "8998", \
+     "--ssl", "/app/ssl", \
+     "--static", "none"]

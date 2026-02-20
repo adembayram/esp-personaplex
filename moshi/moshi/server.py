@@ -309,6 +309,198 @@ class ServerState:
         return ws
 
 
+    async def handle_raw_chat(self, request):
+        """Handle chat with raw PCM audio (int16 LE) instead of Opus encoding.
+        
+        This endpoint is designed for integration with ElatoAI's Node.js server,
+        which sends/receives raw PCM audio from ESP32 devices.
+        
+        Binary protocol (same message kinds as handle_chat):
+          Client -> Server:
+            0x01 + int16_le_pcm_bytes  = audio input
+          Server -> Client:
+            0x00                       = handshake (model ready)
+            0x01 + int16_le_pcm_bytes  = audio output
+            0x02 + utf8_text           = text token
+        """
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        clog = ColorizedLog.randomize()
+        peer = request.remote
+        peer_port = request.transport.get_extra_info("peername")[1]
+        clog.log("info", f"Incoming RAW PCM connection from {peer}:{peer_port}")
+
+        # Parse query parameters for voice and text prompts
+        requested_voice_prompt_path = None
+        voice_prompt_path = None
+        if self.voice_prompt_dir is not None:
+            voice_prompt_filename = request.query.get("voice_prompt", "NATF2.pt")
+            if voice_prompt_filename:
+                requested_voice_prompt_path = os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+            if requested_voice_prompt_path is None or not os.path.exists(requested_voice_prompt_path):
+                raise FileNotFoundError(
+                    f"Requested voice prompt '{voice_prompt_filename}' not found in '{self.voice_prompt_dir}'"
+                )
+            else:
+                voice_prompt_path = requested_voice_prompt_path
+
+        if self.lm_gen.voice_prompt != voice_prompt_path:
+            if voice_prompt_path.endswith('.pt'):
+                self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+            else:
+                self.lm_gen.load_voice_prompt(voice_prompt_path)
+
+        text_prompt = request.query.get("text_prompt", "")
+        self.lm_gen.text_prompt_tokens = (
+            self.text_tokenizer.encode(wrap_with_system_tags(text_prompt))
+            if len(text_prompt) > 0
+            else None
+        )
+        seed = int(request.query["seed"]) if "seed" in request.query else None
+
+        # Shared buffer for incoming raw PCM (float32, accumulated from int16 input)
+        all_pcm_data = None
+
+        async def recv_loop():
+            nonlocal close, all_pcm_data
+            try:
+                async for message in ws:
+                    if message.type == aiohttp.WSMsgType.ERROR:
+                        clog.log("error", f"{ws.exception()}")
+                        break
+                    elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                        break
+                    elif message.type != aiohttp.WSMsgType.BINARY:
+                        clog.log("error", f"unexpected message type {message.type}")
+                        continue
+
+                    data = message.data
+                    if not isinstance(data, bytes) or len(data) == 0:
+                        continue
+
+                    kind = data[0]
+                    if kind == 1:  # audio - raw PCM int16 LE
+                        payload = data[1:]
+                        if len(payload) == 0:
+                            continue
+                        # Convert int16 LE bytes to float32 PCM [-1.0, 1.0]
+                        int16_samples = np.frombuffer(payload, dtype=np.int16)
+                        float_samples = int16_samples.astype(np.float32) / 32768.0
+                        if all_pcm_data is None:
+                            all_pcm_data = float_samples
+                        else:
+                            all_pcm_data = np.concatenate((all_pcm_data, float_samples))
+                    else:
+                        clog.log("warning", f"unknown message kind {kind}")
+            finally:
+                close = True
+                clog.log("info", "recv_loop closed")
+
+        async def process_loop():
+            """Process accumulated PCM through the model and send raw PCM output."""
+            nonlocal all_pcm_data
+
+            while True:
+                if close:
+                    return
+                await asyncio.sleep(0.001)
+
+                if all_pcm_data is None or all_pcm_data.shape[-1] < self.frame_size:
+                    continue
+
+                # Process all available full frames
+                while all_pcm_data is not None and all_pcm_data.shape[-1] >= self.frame_size:
+                    chunk = all_pcm_data[:self.frame_size]
+                    all_pcm_data = all_pcm_data[self.frame_size:] if all_pcm_data.shape[-1] > self.frame_size else None
+
+                    chunk = torch.from_numpy(chunk).to(device=self.device)[None, None]
+                    codes = self.mimi.encode(chunk)
+                    _ = self.other_mimi.encode(chunk)
+
+                    for c in range(codes.shape[-1]):
+                        tokens = self.lm_gen.step(codes[:, :, c:c + 1])
+                        if tokens is None:
+                            continue
+                        assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+
+                        # Decode model output to PCM
+                        main_pcm = self.mimi.decode(tokens[:, 1:9])
+                        _ = self.other_mimi.decode(tokens[:, 1:9])
+                        main_pcm = main_pcm.cpu()
+
+                        # Convert float32 PCM to int16 LE and send
+                        pcm_float = main_pcm[0, 0].numpy()
+                        pcm_int16 = np.clip(pcm_float * 32767, -32768, 32767).astype(np.int16)
+                        await ws.send_bytes(b"\x01" + pcm_int16.tobytes())
+
+                        # Send text token if meaningful
+                        text_token = tokens[0, 0, 0].item()
+                        if text_token not in (0, 3):
+                            _text = self.text_tokenizer.id_to_piece(text_token)
+                            _text = _text.replace("\u2581", " ")
+                            msg = b"\x02" + bytes(_text, encoding="utf8")
+                            await ws.send_bytes(msg)
+
+        clog.log("info", "accepted raw PCM connection")
+        text_prompt_display = request.query.get("text_prompt", "")
+        if text_prompt_display:
+            clog.log("info", f"text prompt: {text_prompt_display}")
+        voice_prompt_display = request.query.get("voice_prompt", "")
+        if voice_prompt_display:
+            clog.log("info", f"voice prompt: {voice_prompt_path} (requested: {requested_voice_prompt_path})")
+
+        close = False
+        async with self.lock:
+            if seed is not None and seed != -1:
+                seed_all(seed)
+
+            self.mimi.reset_streaming()
+            self.other_mimi.reset_streaming()
+            self.lm_gen.reset_streaming()
+
+            async def is_alive():
+                if close or ws.closed:
+                    return False
+                try:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=0.01)
+                    if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                        return False
+                except asyncio.TimeoutError:
+                    return True
+                except aiohttp.ClientConnectionError:
+                    return False
+                return True
+
+            # Process system prompts (voice + text conditioning)
+            await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
+            self.mimi.reset_streaming()
+            clog.log("info", "done with system prompts (raw PCM)")
+
+            # Send handshake to signal readiness
+            if await is_alive():
+                await ws.send_bytes(b"\x00")
+                clog.log("info", "sent handshake bytes (raw PCM)")
+
+                # Run recv and process loops concurrently (no separate send_loop needed)
+                tasks = [
+                    asyncio.create_task(recv_loop()),
+                    asyncio.create_task(process_loop()),
+                ]
+
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                await ws.close()
+                clog.log("info", "raw PCM session closed")
+
+        clog.log("info", "done with raw PCM connection")
+        return ws
+
+
 def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Optional[str]:
     """
     If voice_prompt_dir is None:
@@ -458,6 +650,7 @@ def main():
     state.warmup()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
+    app.router.add_get("/api/raw-chat", state.handle_raw_chat)
     if static_path is not None:
         async def handle_root(_):
             return web.FileResponse(os.path.join(static_path, "index.html"))
