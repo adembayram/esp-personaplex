@@ -408,8 +408,14 @@ class ServerState:
                 close = True
                 clog.log("info", "recv_loop closed")
 
+        # Output queue: process_loop pushes, send_loop sends.
+        # This decouples GPU inference from network IO — critical for model quality.
+        # Without this, await ws.send_bytes() inside the model loop stalls the
+        # streaming transformer, disrupting its timing and degrading context understanding.
+        output_queue = asyncio.Queue()
+
         async def process_loop():
-            """Process accumulated PCM through the model and send raw PCM output."""
+            """Process accumulated PCM through the model — NO network IO here."""
             nonlocal all_pcm_data
 
             while True:
@@ -440,32 +446,38 @@ class ServerState:
                         _ = self.other_mimi.decode(tokens[:, 1:9])
                         main_pcm = main_pcm.cpu()
 
-                        # Check if connection is still alive before sending
-                        # (GPU inference takes time — connection may have closed meanwhile)
+                        # Check if connection is still alive
                         if close or ws.closed:
                             clog.log("info", "process_loop: connection closed during inference, stopping")
                             return
 
-                        # Convert float32 PCM to int16 LE and send
+                        # Convert float32 PCM to int16 LE and push to output queue
+                        # (NON-BLOCKING — does not stall the model)
                         pcm_float = main_pcm[0, 0].numpy()
                         pcm_int16 = np.clip(pcm_float * 32767, -32768, 32767).astype(np.int16)
-                        try:
-                            await ws.send_bytes(b"\x01" + pcm_int16.tobytes())
-                        except (ConnectionResetError, ConnectionError):
-                            clog.log("info", "process_loop: connection reset while sending audio")
-                            return
+                        output_queue.put_nowait(b"\x01" + pcm_int16.tobytes())
 
-                        # Send text token if meaningful
+                        # Push text token if meaningful
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)
                             _text = _text.replace("\u2581", " ")
-                            msg = b"\x02" + bytes(_text, encoding="utf8")
-                            try:
-                                await ws.send_bytes(msg)
-                            except (ConnectionResetError, ConnectionError):
-                                clog.log("info", "process_loop: connection reset while sending text")
-                                return
+                            output_queue.put_nowait(b"\x02" + bytes(_text, encoding="utf8"))
+
+        async def send_loop():
+            """Send queued output over the network — separate from model processing."""
+            while True:
+                if close and output_queue.empty():
+                    return
+                try:
+                    msg = await asyncio.wait_for(output_queue.get(), timeout=0.05)
+                except asyncio.TimeoutError:
+                    continue
+                try:
+                    await ws.send_bytes(msg)
+                except (ConnectionResetError, ConnectionError):
+                    clog.log("info", "send_loop: connection reset while sending")
+                    return
 
         clog.log("info", "accepted raw PCM connection")
         text_prompt_display = request.query.get("text_prompt", "")
@@ -507,10 +519,11 @@ class ServerState:
                 await ws.send_bytes(b"\x00")
                 clog.log("info", "sent handshake bytes (raw PCM)")
 
-                # Run recv and process loops concurrently (no separate send_loop needed)
+                # 3 concurrent tasks — matches handle_chat architecture
                 tasks = [
                     asyncio.create_task(recv_loop()),
                     asyncio.create_task(process_loop()),
+                    asyncio.create_task(send_loop()),
                 ]
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
