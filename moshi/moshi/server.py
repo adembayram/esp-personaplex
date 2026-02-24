@@ -440,10 +440,20 @@ class ServerState:
                         _ = self.other_mimi.decode(tokens[:, 1:9])
                         main_pcm = main_pcm.cpu()
 
+                        # Check if connection is still alive before sending
+                        # (GPU inference takes time — connection may have closed meanwhile)
+                        if close or ws.closed:
+                            clog.log("info", "process_loop: connection closed during inference, stopping")
+                            return
+
                         # Convert float32 PCM to int16 LE and send
                         pcm_float = main_pcm[0, 0].numpy()
                         pcm_int16 = np.clip(pcm_float * 32767, -32768, 32767).astype(np.int16)
-                        await ws.send_bytes(b"\x01" + pcm_int16.tobytes())
+                        try:
+                            await ws.send_bytes(b"\x01" + pcm_int16.tobytes())
+                        except (ConnectionResetError, ConnectionError):
+                            clog.log("info", "process_loop: connection reset while sending audio")
+                            return
 
                         # Send text token if meaningful
                         text_token = tokens[0, 0, 0].item()
@@ -451,7 +461,11 @@ class ServerState:
                             _text = self.text_tokenizer.id_to_piece(text_token)
                             _text = _text.replace("\u2581", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
-                            await ws.send_bytes(msg)
+                            try:
+                                await ws.send_bytes(msg)
+                            except (ConnectionResetError, ConnectionError):
+                                clog.log("info", "process_loop: connection reset while sending text")
+                                return
 
         clog.log("info", "accepted raw PCM connection")
         text_prompt_display = request.query.get("text_prompt", "")
