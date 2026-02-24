@@ -399,6 +399,9 @@ class ServerState:
                             all_pcm_data = float_samples
                         else:
                             all_pcm_data = np.concatenate((all_pcm_data, float_samples))
+                    elif kind == 6:  # ping - keep-alive message (0x06)
+                        # Ping received, connection is alive (no response needed)
+                        pass
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
             finally:
