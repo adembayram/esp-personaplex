@@ -976,7 +976,9 @@ class LMGen(StreamingModule[_LMGenState]):
 
     def load_voice_prompt_embeddings(self, path: str):
         self.voice_prompt = path
-        state = torch.load(path)
+        # weights_only=False is used because the embedding file contains custom objects
+        # or structures that require it, but making it explicit silences the warning.
+        state = torch.load(path, weights_only=False)
 
         self.voice_prompt_audio = None
         self.voice_prompt_embeddings = state["embeddings"].to(self.lm_model.device)

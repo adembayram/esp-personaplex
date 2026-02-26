@@ -466,6 +466,7 @@ class ServerState:
 
         async def send_loop():
             """Send queued output over the network — separate from model processing."""
+            nonlocal close
             while True:
                 if close and output_queue.empty():
                     return
@@ -475,8 +476,9 @@ class ServerState:
                     continue
                 try:
                     await ws.send_bytes(msg)
-                except (ConnectionResetError, ConnectionError):
+                except (ConnectionResetError, ConnectionError, OSError):
                     clog.log("info", "send_loop: connection reset while sending")
+                    close = True  # Signal process_loop to stop
                     return
 
         clog.log("info", "accepted raw PCM connection")
